@@ -30,9 +30,17 @@ Questions and answers from my doubt sessions live in [linux-doubts.md](linux-dou
     - [x] List what's on the old disk (`find` → `~/old-disk-files.txt`, searched with `grep`). Its future: decide in Phase 5.
   - [x] Installing packages with apt (`ncdu`, `smartmontools` installed)
   - [x] Editing config files (fix the boot delay: ~2 min → ~4 s)
-  - [ ] Assignment 3: Managing services ← next
+  - [x] Assignment 3: Managing services
+    - [x] Part 1: look around, control ModemManager, read logs, check SSH (not installed)
+    - [x] Confirm the apt wait-online timeout cause (bare wait counts Ethernet as required)
+    - [x] Fix it: removed `enp2s0` from netplan and masked dracut's catch-all `zzzz-dracut-default.network`
+    - [x] Read a unit file (`systemctl cat systemd-networkd-wait-online`, with a drop-in)
+    - [x] Part 2: build my own `heartbeat` service
+      - [x] Script, unit file, start, watch the log
+      - [x] Crash test: `kill -9`, PID 2204 → 2641, restarted after exactly 5 s
+      - [x] Manual stop, enable at boot + reboot, clean up (`Unit heartbeat.service could not be found`)
+  - [ ] Assignment 4: Directories, users and permissions ← next
   - [ ] Removing packages (`apt remove`, `purge`, `autoremove`)
-  - [ ] Directories, users and permissions
 - [ ] Phase 2: Networking and SSH
 - [ ] Phase 3: Backend infrastructure (Git, Node.js, Nginx, PostgreSQL, MongoDB, Redis, PM2)
 - [ ] Phase 4: Docker and Docker Compose
@@ -201,6 +209,25 @@ cat /etc/os-release
 
 `cat` prints a file's contents. `/etc` is where Linux keeps system configuration. This file describes the installed OS.
 Look for: `PRETTY_NAME` and `VERSION` (e.g. `24.04 LTS`). LTS = Long Term Support, which means 5 years of security updates.
+
+"Linux version" can mean two things:
+- The distribution (distro): Ubuntu, with its version like `26.04.1 LTS`. This is the whole package of programs, tools and settings.
+- The kernel: Linux itself, the core that talks to the hardware, with its own version number like `6.x` or `7.x`. Ubuntu ships its own build of it. Driver problems (like the ath10k AER spam) depend on the kernel version.
+
+| Command | What it shows |
+|---|---|
+| `cat /etc/os-release` | Distro name and version. Works on every modern distro. |
+| `lsb_release -a` | Distro version in four short lines: `Distributor ID`, `Description`, `Release`, `Codename`. If it says `command not found`, use `cat /etc/os-release`. |
+| `hostnamectl` | Hostname, OS, kernel, architecture and hardware model, all in one screen. |
+| `uname -r` | Kernel version only (`-r` = release), e.g. `6.8.0-45-generic`. |
+| `uname -a` | Everything `uname` knows (`-a` = all): kernel name, hostname, kernel version, build date, architecture. |
+
+Reading a kernel version like `6.8.0-45-generic`:
+- `6.8.0`: the upstream Linux version (major.minor.patch).
+- `-45`: Ubuntu's build number. It goes up with each kernel security update.
+- `-generic`: the kernel flavour. `generic` is Ubuntu's standard one.
+
+After a kernel update, `uname -r` keeps showing the old version until you reboot, because the running kernel only changes at boot.
 
 #### 2. CPU
 
@@ -922,7 +949,28 @@ Source for the load-cycle rating: [WD10SPZX spec](https://www.zones.com/site/pro
 
 ### Assignment 3: Managing services
 
-Practise on `ModemManager`. The Dell has no SIM modem, so it's safe to stop, and turning it off is a real cleanup.
+Goal: control background services with `systemctl`, read their logs with `journalctl`, and understand the unit files that define them. Part 2 builds my own service, the same way my Node.js API will run in Phase 3.
+
+#### How it fits together
+
+- systemd is PID 1, the first process (seen in `top`). It starts everything else at boot, keeps track of it, and can restart services that crash.
+- A daemon is a background program with no screen. Names often end in `d`: `sshd`, `journald`, `thermald`.
+- A unit is anything systemd manages, described by a small text file. The ending says what kind:
+
+| Unit type | Example | What it is |
+|---|---|---|
+| `.service` | `cron.service` | A program running in the background |
+| `.socket` | `ssh.socket` | A port systemd listens on. It starts the matching service when someone connects. |
+| `.timer` | `apt-daily.timer` | A schedule that starts a service (systemd's version of cron) |
+| `.target` | `multi-user.target` | A group of units = a stage of boot. `multi-user.target` = normal server boot, no GUI. |
+| `.mount` | `boot.mount` | A mounted filesystem, generated from `/etc/fstab` |
+
+- `.service` is optional in commands: `systemctl status cron` = `systemctl status cron.service`.
+- Where unit files live:
+  - `/usr/lib/systemd/system/`: installed by packages. Don't edit, an update overwrites them.
+  - `/etc/systemd/system/`: mine. Files here win over the package ones, and my own services go here.
+
+#### Command reference: systemctl
 
 | Command | What it does |
 |---|---|
@@ -937,11 +985,57 @@ Practise on `ModemManager`. The Dell has no SIM modem, so it's safe to stop, and
 | `sudo systemctl mask <name>` | Block it completely, so nothing can start it. Undo with `unmask`. |
 | `systemctl is-active <name>` | Prints just `active` or `inactive`. |
 | `systemctl is-enabled <name>` | Prints just `enabled` or `disabled`. |
+| `systemctl list-units --type=service` | Services loaded right now, running or not. |
 | `systemctl list-unit-files --type=service` | Every installed service and whether it starts at boot. |
+| `systemctl list-timers` | Scheduled jobs: when each one last ran and when it runs next. |
 | `systemctl --failed` | Services that crashed or failed to start. |
-| `journalctl -u <name> -n 20` | Last 20 log lines for one service (`-u` = unit). |
-| `journalctl -u <name> -f` | Follow the log live (`Ctrl + C` to stop). |
-| `journalctl -b -p err` | Only errors (`-p err`) since this boot (`-b`). |
+| `systemctl cat <name>` | Print the unit file (plus any overrides). |
+| `systemctl get-default` | The target the machine boots into. |
+| `sudo systemctl daemon-reload` | Make systemd re-read unit files after I create or edit one. |
+| `sudo systemctl edit <name>` | Override part of a package's unit file safely. Saves a small "drop-in" file in `/etc/systemd/system/<name>.service.d/`. |
+
+#### Command reference: journalctl
+
+journald collects the output of every service, the kernel and boot into one log (the journal). `journalctl` reads it. It opens in a pager with the same keys as `less` (`q` quits, `/word` searches).
+
+| Command | What it does |
+|---|---|
+| `journalctl -e` | Open at the end (newest entries). Plain `journalctl` starts at the oldest. |
+| `journalctl -r` | Newest first. |
+| `journalctl -u <name> -n 20` | Last 20 lines for one unit (`-u` = unit, `-n` = number). |
+| `journalctl -u <name> -f` | Follow live, like a live feed (`Ctrl + C` to stop). |
+| `journalctl -b` | This boot only. `-b -1` = the previous boot. |
+| `journalctl -b -p err` | Only errors and worse (`-p` = priority) from this boot. |
+| `journalctl --since "1 hour ago"` | Time filter. Also `--since today`, `--since "2026-11-22 10:00"`, `--until ...`. |
+| `journalctl -k` | Kernel messages only. Like `dmesg`, but kept across reboots. |
+| `journalctl --no-pager` | Print straight to the screen instead of opening the pager. |
+| `journalctl --disk-usage` | How much disk space the logs take. |
+
+Priorities, most to least serious: `emerg` 0, `alert` 1, `crit` 2, `err` 3, `warning` 4, `notice` 5, `info` 6, `debug` 7. `-p err` shows `err` and everything above it.
+
+A log line reads as: `Nov 22 10:26:35 atrocity-old-dell ModemManager[812]: <message>` = time, hostname, program`[PID]`, message.
+
+`-u` filters by unit, not by program name. A program started by another service is logged under that service. Example: the wait-online timeout at 20:46 belonged to `apt-daily-upgrade.service`, so `-u systemd-networkd-wait-online` doesn't show it. When `-u` finds nothing, search by time (`--since` / `--until`) or by text (`| grep`).
+
+`-- No entries --` can also just mean a typo in the unit name. List the real names with `systemctl list-units --all | grep wait`.
+
+#### Step 1: Look around (read-only)
+
+```bash
+systemctl get-default
+systemctl --failed
+systemctl list-timers
+systemctl list-unit-files --type=service | less
+```
+
+- `get-default`: should say `graphical.target` or `multi-user.target`. On a server without a desktop, both end up at the same text login.
+- `--failed`: ideally `0 loaded units listed`.
+- `list-timers`: Ubuntu's own scheduled housekeeping, such as `apt-daily` (check for updates), `logrotate` (compress and delete old logs), `fstrim` (SSD maintenance). `LAST` / `PASSED` = when it ran, `NEXT` / `LEFT` = when it runs again.
+- `list-unit-files` `STATE` column: `enabled` (starts at boot), `disabled`, `static` (can't be enabled by itself, another unit or timer starts it), `masked` (blocked). `PRESET` = Ubuntu's default.
+
+#### Step 2: Read `systemctl status`
+
+Practise on `ModemManager`. The Dell has no SIM modem, so it's safe to stop, and turning it off is a real cleanup.
 
 Reading `systemctl status`:
 
@@ -959,7 +1053,7 @@ Reading `systemctl status`:
 - `Memory`: how much RAM it uses right now.
 - The lines at the bottom are its most recent log entries.
 
-Practice run:
+#### Step 3: Control a service
 
 ```bash
 systemctl status ModemManager           # look: active (running), enabled
@@ -967,13 +1061,84 @@ sudo systemctl stop ModemManager
 systemctl status ModemManager           # now: inactive (dead), but still enabled
 sudo systemctl start ModemManager
 sudo systemctl restart ModemManager
+systemctl status ModemManager           # new Main PID: restart = a fresh process
 journalctl -u ModemManager -n 20        # its log, including the stops/starts you just did
 sudo systemctl disable --now ModemManager
 systemctl is-enabled ModemManager       # disabled
 systemctl is-active ModemManager        # inactive
 ```
 
-Check whether the SSH server is installed (we set it up properly in Phase 2):
+- `stop` / `start` = right now. `enable` / `disable` = at boot. Two separate switches. `--now` flips both.
+- `disable` prints `Removed "/etc/systemd/system/multi-user.target.wants/ModemManager.service"`. Enabling a service is just a shortcut (symlink) in that folder, and disabling deletes the shortcut. See them all: `ls /etc/systemd/system/multi-user.target.wants/`.
+- Undo any time: `sudo systemctl enable --now ModemManager`.
+
+#### Step 4: Read logs
+
+```bash
+journalctl -u ModemManager -n 20
+journalctl -b -p err
+journalctl --since "1 hour ago" | tail -n 20
+journalctl --disk-usage
+```
+
+- `-b -p err` may show the `ath10k_pci ... AER` lines. That's the Wi-Fi issue already tracked in the troubleshooting log. Anything else in there is worth a look.
+- `| tail -n 20`: only the last 20 lines. Piping into `tail` skips the pager.
+- Lines cut off at the screen edge? The pager doesn't wrap long lines. Press `→` to scroll right, or add `--no-pager` so lines wrap onto the next row.
+
+My result (boot of Nov 23, 20:09), 3 errors:
+
+| Time | Message | Verdict |
+|---|---|---|
+| 20:09:50 | `kernel: KHO: Failed to reserve lowmem scratch buffer` | Harmless. KHO = Kexec HandOver, a new kernel feature that keeps memory alive while jumping straight into a new kernel without a full reboot (used by cloud hosts for live updates). Ubuntu's kernel turns it on by default and reserves memory for it at boot. I don't use kexec, so a failed reservation changes nothing. |
+| 20:09:50 | `kernel: x86/cpu: SGX disabled or unsupported by BIOS.` | Harmless. SGX = Software Guard Extensions, Intel's "secure enclave" feature, used by some DRM and niche security software. The i5-8250U has it, but the Dell BIOS has it switched off. Nothing in this roadmap uses it. |
+| 20:46:36 | `systemd-networkd-wait-online[1972]: Timeout occurred while waiting for network connectivity` | Worth checking. Happened ~37 minutes after boot, so it didn't slow the boot down. Something started later asked "is the network online?", and the answer never came within 2 minutes. See the troubleshooting log. |
+
+Lesson: `err` is the priority the program chose, not a verdict. Read the message and decide. Kernel messages often use `err` for "a feature I tried isn't available here".
+
+Sources: [KHO kernel docs](https://docs.kernel.org/7.1/admin-guide/mm/kho.html), [Ubuntu enables KHO by default (Proxmox mailing list)](https://lore.proxmox.com/pve-devel/1f8840f9-a651-41ff-b9f0-7c46fa26ed8b@proxmox.com/).
+
+#### Step 5: Read a unit file
+
+```bash
+systemctl cat cron
+systemctl cat ssh.socket
+```
+
+The first line (`# /usr/lib/systemd/system/cron.service`) is where the file lives. Then three sections:
+
+| Section | Key | Meaning |
+|---|---|---|
+| `[Unit]` | `Description=` | The name shown in `status` |
+| | `After=` | Start order: start after these units. Order only, not a dependency. |
+| | `Wants=` / `Requires=` | Dependencies: soft (start them too) / hard (fail if they fail) |
+| `[Service]` | `ExecStart=` | The exact command systemd runs |
+| | `Restart=` | `no` (default), `on-failure` (restart if it crashes), `always` |
+| | `User=` | Run as this user instead of root |
+| | `EnvironmentFile=` | Load environment variables from a file. A `-` in front = fine if the file is missing. |
+| `[Socket]` | `ListenStream=` | The port a socket listens on (`22` for SSH) |
+| `[Install]` | `WantedBy=multi-user.target` | What `enable` hooks it into: "start this during normal boot" |
+
+My example: `systemctl cat systemd-networkd-wait-online`
+
+| Line | Meaning |
+|---|---|
+| `# /usr/lib/systemd/system/systemd-networkd-wait-online.service` | The main file, installed by the systemd package |
+| `ConditionCapability=CAP_NET_ADMIN` | Only run if allowed to manage the network. A `Condition...` that isn't met = quietly skipped, not failed. |
+| `DefaultDependencies=no` | Skip the usual automatic ordering, so it can run early in boot |
+| `BindsTo=systemd-networkd.service` | Tied to networkd: if networkd stops, this stops too |
+| `After=` / `Before=network-online.target` | Runs after networkd has started, and before "network is online" is announced |
+| `Type=oneshot` | Runs once and exits, it's not a long-running daemon. systemd waits for it to finish before moving on. |
+| `RemainAfterExit=yes` | Stays "active" after a successful exit, so it isn't run a second time |
+| `WantedBy=network-online.target` | `enable` hooks it into `network-online.target` |
+| `# /run/systemd/generator.late/systemd-networkd-wait-online.service.d/10-netplan.conf` | A drop-in written by netplan's generator (a small program systemd runs at every boot to create units). `/run` is in RAM, so it's rebuilt every boot. Never edit it, change the netplan YAML instead. |
+| `ConditionPathIsSymbolicLink=...` | Only run if netplan enabled this unit |
+| `lines 1-32` at the bottom | The pager has more below. `Space` / `↓` to keep reading, or `systemctl cat <name> --no-pager`. |
+
+Drop-ins stack on top of the main file. Lines in a drop-in add to or replace lines in the main file, and an empty `ExecStart=` clears the original command before setting a new one.
+
+#### Step 6: Is the SSH server installed?
+
+We set it up properly in Phase 2.
 
 ```bash
 systemctl status ssh.socket
@@ -981,6 +1146,207 @@ systemctl status ssh.socket
 
 - `active (listening)`: installed and waiting for connections on port 22.
 - `Unit ssh.socket could not be found`: the OpenSSH server isn't installed yet.
+
+#### My Part 1 results
+
+| Step | Result |
+|---|---|
+| `systemctl --failed` | `0 loaded units listed`: nothing has crashed. |
+| ModemManager | Stopped and disabled. `status` shows `inactive (dead)`. (`is-enabled` prints `disabled`, `is-active` prints `inactive`.) |
+| `journalctl -b -p err` | 3 errors: KHO and SGX harmless, the wait-online timeout came from `apt-daily-upgrade` (see troubleshooting log). |
+| `ssh.socket` | Not found: the OpenSSH server isn't installed. First task of Phase 2: `sudo apt install openssh-server`. |
+
+#### Part 2: Build my own service
+
+This is exactly how a Node.js API will run in Phase 3: a unit file, `ExecStart`, `Restart`, logs in the journal. Here the "app" is a tiny script that prints a line every 10 seconds.
+
+Processes and signals first:
+
+| Command | What it does |
+|---|---|
+| `ps aux` | Every process: `USER`, `PID`, `%CPU`, `%MEM`, `COMMAND`. `a` = all users, `u` = user-friendly columns, `x` = include ones without a terminal. |
+| `ps aux \| grep heartbeat` | Find one program. The `grep heartbeat` line itself also shows up, ignore it. |
+| `pgrep -a heartbeat` | Cleaner: PID and full command of matching processes. |
+| `kill <PID>` | Ask a process to stop (signal `TERM`, 15). It can clean up first. |
+| `kill -9 <PID>` | Force-kill (signal `KILL`, 9). It can't refuse or clean up. Simulates a crash. |
+
+1. Write the script. `/usr/local/bin` is for programs installed by hand (apt uses `/usr/bin`).
+
+```bash
+sudo nano /usr/local/bin/heartbeat.sh
+```
+
+```bash
+#!/bin/bash
+# Prints one line every 10 seconds. systemd sends the output to the journal.
+while true; do
+  echo "heartbeat $(date +%T)"
+  sleep 10
+done
+```
+
+- `#!/bin/bash` (the "shebang"): tells Linux which program runs this file.
+- `$(date +%T)`: runs `date` and pastes the time (`HH:MM:SS`) into the line.
+
+2. Make it executable, and test it by hand:
+
+```bash
+ls -l /usr/local/bin/heartbeat.sh       # -rw-r--r--  (no x = can't be run)
+sudo chmod +x /usr/local/bin/heartbeat.sh
+ls -l /usr/local/bin/heartbeat.sh       # -rwxr-xr-x  (x = execute permission)
+/usr/local/bin/heartbeat.sh             # prints a line every 10 s. Ctrl + C to stop.
+```
+
+3. Write the unit file:
+
+```bash
+sudo nano /etc/systemd/system/heartbeat.service
+```
+
+```ini
+[Unit]
+Description=Heartbeat demo (prints a line every 10 s)
+
+[Service]
+ExecStart=/usr/local/bin/heartbeat.sh
+Restart=always
+RestartSec=5
+User=atrocity
+
+[Install]
+WantedBy=multi-user.target
+```
+
+- `Restart=always` + `RestartSec=5`: if it dies for any reason, start it again after 5 seconds.
+- `User=atrocity`: run as me, not root. A service only gets the power it needs. If it's ever hacked, the attacker isn't root.
+
+4. Start it and watch it:
+
+```bash
+sudo systemctl daemon-reload            # systemd reads the new file
+sudo systemctl start heartbeat
+systemctl status heartbeat              # active (running), note the Main PID
+journalctl -u heartbeat -f              # a new line every 10 s. Ctrl + C to stop watching (the service keeps running)
+```
+
+Reading `status` for my own service:
+- `Loaded: ... /etc/systemd/system/heartbeat.service; disabled` = my file, not started at boot (yet).
+- `CGroup:` shows two processes: `/bin/bash /usr/local/bin/heartbeat.sh` and its child `sleep 10`. A cgroup (control group) is the box systemd puts every process of a service into, children included. That's how `stop` can kill all of them, and how `Memory:` counts all of them.
+- Log lines look like `heartbeat.sh[1234]: heartbeat 22:41:10`.
+
+Tip: two terminals on the Dell. `-f` keeps the screen busy, so open a second login with `Ctrl + Alt + F2` (log in again). Watch the log on one, run commands on the other. `Ctrl + Alt + F1` goes back. Each one is a separate `tty` (terminal), and `getty@tty2` starts when you switch to it.
+
+5. Crash it and watch systemd bring it back:
+
+```bash
+systemctl show -p MainPID --value heartbeat   # just the main PID number
+pgrep -a heartbeat                      # same PID, with the full command
+sudo kill -9 <PID>
+systemctl status heartbeat              # "activating (auto-restart)" for 5 s, then running with a NEW PID
+journalctl -u heartbeat -n 10           # "Main process exited, code=killed, status=9/KILL" ... "Scheduled restart job"
+```
+
+- `systemctl show -p <Property> --value`: print one setting of a unit, nothing else. Handy in scripts.
+- Expected journal lines after the kill:
+
+```text
+heartbeat.service: Main process exited, code=killed, status=9/KILL
+heartbeat.service: Failed with result 'signal'.
+heartbeat.service: Scheduled restart job, restart counter is at 1.
+Started heartbeat.service - Heartbeat demo (prints a line every 10 s).
+```
+
+- The leftover `sleep 10` child is cleaned up too: systemd kills everything in the cgroup before restarting.
+
+If it doesn't start:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `status=203/EXEC` | The script isn't executable, the path in `ExecStart=` is wrong, or the `#!/bin/bash` line has a typo | `ls -l /usr/local/bin/heartbeat.sh` (needs `x`), check the path and first line |
+| `Warning: The unit file ... changed on disk` | Edited the unit file without reloading | `sudo systemctl daemon-reload` |
+| `Unit heartbeat.service not found` | File name or folder wrong | `ls /etc/systemd/system/heartbeat.service` |
+| Log shows `heartbeat` with no time | `$(date +%T)` typed wrong (needs the `+`) | Fix the script, then `sudo systemctl restart heartbeat` |
+| `Started heartbeat.service.` without ` - <description>` | `Description=` missing or misspelled under `[Unit]` | `sudo nano /etc/systemd/system/heartbeat.service`, then `sudo systemctl daemon-reload` |
+
+My crash test result (Nov 24):
+
+```text
+Main PID before: 2204   after: 2641
+18:51:04 systemd[1]: heartbeat.service: Main process exited, code=killed, status=9/KILL
+18:51:04 systemd[1]: heartbeat.service: Failed with result 'signal'.
+18:51:09 systemd[1]: heartbeat.service: Scheduled restart job, restart counter is at 1.
+18:51:09 systemd[1]: Started heartbeat.service.
+```
+
+- New PID = a brand new process. Nothing "came back to life": systemd started a fresh copy.
+- 18:51:04 → 18:51:09 = exactly 5 s, which is `RestartSec=5`. The log proves the setting works.
+- `status=9/KILL` = killed by signal 9. `Failed with result 'signal'` = systemd counts that as a failure.
+- `restart counter is at 1`: systemd counts restarts. Crash-loop protection: by default, more than 5 starts within 10 s and systemd gives up and marks the unit `failed` (`StartLimitBurst=5`, `StartLimitIntervalSec=10s`). With `RestartSec=5`, this service can't hit that limit.
+- `Started heartbeat.service.` with nothing after it: normally the line reads `Started heartbeat.service - <Description>`. No description means the `Description=` line in `[Unit]` is missing or misspelled. Check with `systemctl cat heartbeat`. The log shows my config back to me.
+
+Bonus: `Restart=always` vs `Restart=on-failure`
+
+| How it ended | `always` | `on-failure` |
+|---|---|---|
+| `kill -9` (crash) | Restarts | Restarts |
+| `kill` (signal 15 `TERM`, a polite "please stop") | Restarts | Doesn't restart: `TERM` counts as a clean stop |
+| Program exits with code 0 (finished normally) | Restarts | Doesn't restart |
+| Program exits with code 1 (error) | Restarts | Restarts |
+| `systemctl stop` | Doesn't restart | Doesn't restart |
+
+For an always-on API, `always` is the usual choice. `on-failure` suits jobs that are allowed to finish.
+
+Try it: `sudo kill <PID>` (no `-9`) restarts with `always`. Then change `Restart=on-failure` in the unit file, `sudo systemctl daemon-reload`, `sudo systemctl restart heartbeat`, `sudo kill <PID>` again: it stays dead.
+
+6. Manual stop is respected:
+
+```bash
+sudo systemctl stop heartbeat
+systemctl status heartbeat              # inactive (dead), and it stays dead
+```
+
+`Restart=` only reacts to unexpected exits. `systemctl stop` is me asking, so systemd doesn't fight it.
+
+When a service stops (or crashes), systemd logs a resource summary for that run. See doubt #12 in [linux-doubts.md](linux-doubts.md).
+
+```text
+heartbeat.service: Consumed 1.485s CPU time over 17min wall clock time, 3.4M memory peak.
+```
+
+- `CPU time`: how long the CPU actually worked for the service (all its processes added up).
+- `wall clock time`: how long the service ran in real time.
+- `memory peak`: the most RAM it used at once.
+- 1.485 s of CPU in 17 min ≈ 0.15% of one core: mostly asleep, very light.
+- `journalctl -u heartbeat | grep Consumed`: one summary line per run. While it's running, `systemctl status` shows live `Memory:` and `CPU:` lines.
+
+7. Start at boot (optional, to see `enable` work on my own service):
+
+```bash
+sudo systemctl enable --now heartbeat   # "Created symlink ... multi-user.target.wants/heartbeat.service"
+ls -l /etc/systemd/system/multi-user.target.wants/ | grep heartbeat   # the symlink enable just made
+sudo reboot
+systemctl status heartbeat              # running again, nobody started it by hand
+journalctl -u heartbeat -b -n 5         # -b = this boot: first lines are from boot time
+```
+
+- `enable` = the `[Install]` section in action. `WantedBy=multi-user.target` told it which folder to put the symlink in.
+
+8. Clean up:
+
+```bash
+sudo systemctl disable --now heartbeat
+sudo rm /etc/systemd/system/heartbeat.service /usr/local/bin/heartbeat.sh
+sudo systemctl daemon-reload
+systemctl status heartbeat              # Unit heartbeat.service could not be found
+```
+
+My result: all steps done. Stopped by hand and it stayed stopped, came back by itself after a reboot once enabled, then removed. The final `status` says `Unit heartbeat.service could not be found`, which is the goal here: the error proves the cleanup worked.
+
+What Assignment 3 taught me, in one list:
+- `start`/`stop` = now, `enable`/`disable` = at boot.
+- `Restart=always` brings a crashed service back. `systemctl stop` is respected.
+- Every service's output lands in the journal: `journalctl -u <name>`.
+- A service is just a program plus a small unit file in `/etc/systemd/system/`. Phase 3's Node.js API will get the same treatment: `ExecStart=/usr/bin/node /opt/api/server.js`, `User=`, `Restart=always`, and environment variables via `Environment=` or `EnvironmentFile=`.
 
 ### Kernel messages: the ath10k AER spam
 
@@ -1076,12 +1442,12 @@ Undo: `sudo cp /etc/default/grub.bak /etc/default/grub`, `sudo update-grub`, `su
 
 Not started. Things already found that we'll handle here:
 
-- [ ] Install / check the SSH server and log in from the Acer: `ssh atrocity@192.168.1.8`
+- [ ] Install the SSH server (`ssh.socket` not found = not installed: `sudo apt install openssh-server`), then log in from the Acer: `ssh atrocity@192.168.1.8`
 - [ ] Give the Dell a fixed IP: reserve `192.168.1.8` for its Wi-Fi MAC address in the router (DHCP reservation)
 - [ ] Stop the laptop sleeping when the lid closes. By default `systemd-logind` suspends on lid close, which takes the server offline. Until then, keep the lid open.
 - [x] Fix the boot delay from the unplugged Ethernet port (netplan `optional: true`). Done early: boot ~2 min → ~4 s.
 - [ ] The Wi-Fi password is saved in plain text in `/etc/netplan/*.yaml`. Never copy that file into this public repo, a chat or a screenshot. Show it with `sudo grep -v password` instead.
-- [ ] Ethernet `enp2s0` has no `dhcp4: true` in netplan. Add it before plugging in a cable.
+- [x] Ethernet `enp2s0` removed from netplan, and dracut's catch-all `zzzz-dracut-default.network` masked (fix for the apt wait-online timeout). So a plugged-in cable gets no IP until I add `enp2s0` back to netplan with `dhcp4: true`. Leave out `optional: true` if Ethernet becomes the main connection. With `optional: true` and no cable, the apt timeout comes back.
 
 ### Fix: boot delay from the unplugged Ethernet port
 
@@ -1196,7 +1562,7 @@ systemd-analyze                         # total should be much lower
 systemd-analyze blame | head -n 5       # wait-online should drop off the top
 ```
 
-Undo, if needed: `sudo cp /etc/netplan/50-cloud-init.yaml.bak /etc/netplan/50-cloud-init.yaml`, then `sudo netplan apply`.
+Undo, if needed: `sudo cp /etc/netplan/00-installer-config.yaml.bak /etc/netplan/00-installer-config.yaml`, then `sudo netplan apply`.
 
 ---
 
@@ -1301,9 +1667,191 @@ Status: solved. Diagnosed with `systemd-analyze`, `systemd-analyze blame` and `s
 - Clue: `ip addr` shows Ethernet `enp2s0` with `NO-CARRIER` (no cable).
 - Confirmed: `systemd-analyze blame | head -n 5` shows `systemd-networkd-wait-online.service` at the top.
 - Cause: netplan has `enp2s0` configured, so boot waits for a network that will never come up until the wait times out.
-- Fix: add `optional: true` under `enp2s0` in `/etc/netplan/50-cloud-init.yaml`, then `sudo netplan try`. Full steps in "Fix: boot delay from the unplugged Ethernet port" (Phase 2).
+- Fix: add `optional: true` under `enp2s0` in `/etc/netplan/00-installer-config.yaml`, then `sudo netplan try`. Full steps in "Fix: boot delay from the unplugged Ethernet port" (Phase 2).
+- Why exactly ~2 minutes: `systemd-networkd-wait-online` gives up after 120 seconds by default. A delay that matches a round timeout is a strong clue that something is waiting, not working.
 - Result: boot ~2 min → ~4 s. My netplan file turned out to be `/etc/netplan/00-installer-config.yaml` (found with `sudo grep -l enp2s0 /etc/netplan/*.yaml`), not `50-cloud-init.yaml`.
 - Lesson: measure first (`systemd-analyze blame`), back up before editing (`cp file file.bak`), apply network changes with `netplan try` so a mistake rolls itself back.
+
+### `systemd-networkd-wait-online: Timeout occurred while waiting for network connectivity` after boot
+
+- Seen: in `journalctl -b -p err` for the boot of Nov 23. Boot at 20:09:50, timeout at 20:46:36.
+- What it means: `systemd-networkd-wait-online` waits until every required interface is "online", then exits. It gives up after 120 s. So at 20:44:36 something started it, and 2 minutes later at least one required interface still wasn't online.
+- Not the boot delay coming back: if it had run during boot, the timeout would be at ~20:11:50.
+- Who started it: `apt-daily-upgrade.service` (Ubuntu's daily automatic-update job, started by a timer). Its helper `apt-helper` ran the wait-online program directly as a child process, not as the `systemd-networkd-wait-online.service` unit:
+
+```text
+20:46:05 systemd[1]: Starting apt-daily-upgrade.service - Daily apt upgrade and clean activities...
+20:46:36 systemd-networkd-wait-online[1972]: Timeout occurred while waiting for network connectivity.
+20:46:36 apt-helper[1970]: E: Sub-process /lib/systemd/systemd-networkd-wait-online returned an error code (1)
+20:46:55 systemd[1]: Finished apt-daily-upgrade.service - Daily apt upgrade and clean activities.
+20:46:55 systemd[1]: apt-daily-upgrade.service: Consumed 15.431s CPU time over 49.819s wall clock time, 424.2M memory peak.
+```
+
+  - PIDs back this up: `apt-helper` is 1970 and wait-online is 1972. Numbers that close mean apt-helper started it a moment earlier.
+  - It waited ~30 s (20:46:05 → 20:46:36), apt-helper's own limit, not the unit's 120 s.
+  - Harmless: the upgrade job finished anyway ("Finished ..."). Its unit runs the wait as `ExecStartPre=-...`, and the `-` means "ignore if this fails".
+  - Why `journalctl -u systemd-networkd-wait-online` can't show this: `-u` filters by unit, and this run belonged to `apt-daily-upgrade.service`. Look there: `journalctl -b -u apt-daily-upgrade`.
+  - Side lesson: systemd measures every service. `424.2M memory peak` = the daily upgrade briefly needed ~0.4 GB of RAM.
+- `networkctl` at the time of checking:
+
+```text
+IDX LINK    TYPE     OPERATIONAL SETUP
+  1 lo      loopback carrier     unmanaged
+  2 enp2s0  ether    no-carrier  configuring
+  3 wlp3s0  wlan     routable    configured
+```
+
+  - Wi-Fi was fine: `routable` + `configured`. No Wi-Fi drop in the log window either.
+  - `enp2s0` is stuck at `configuring`: networkd manages it, but with no cable it can never finish.
+- Likely cause: two different ways of asking "is the network online?"
+  1. At boot, the `systemd-networkd-wait-online.service` unit runs with a netplan drop-in that names only the non-optional interfaces (`-i wlp3s0`). So `optional: true` works there, and boot is fast.
+  2. `apt-helper` runs the bare program without those options. Then it waits for every interface networkd manages, including `enp2s0`, which will never be ready. It times out every time.
+  - Background: netplan switched to that per-interface drop-in instead of marking links `RequiredForOnline` ([netplan PR #456](https://github.com/canonical/netplan/pull/456)). The same apt-helper timeout shows up wherever networkd has a link that never comes up ([example](https://blinkinglightsclub.hashnode.dev/proxmox-lxc-apt-wait-online-timeout)).
+- Diagnose (confirm the theory):
+
+```bash
+networkctl                                                   # every link and its state
+journalctl -b -u systemd-networkd-wait-online --no-pager     # the boot-time run (note: networkd, with a d)
+journalctl -b --since "20:44" --until "20:47" --no-pager     # what else happened then
+systemctl list-dependencies --reverse network-online.target  # who wants "network online"
+systemctl cat systemd-networkd-wait-online                   # the unit + netplan's drop-in: look for "-i wlp3s0"
+networkctl status enp2s0 | grep -i required                  # "Required For Online: yes" = counted by the bare wait
+sudo /lib/systemd/systemd-networkd-wait-online --timeout=15; echo "exit code: $?"          # bare, like apt-helper: expect 1 after 15 s
+sudo /lib/systemd/systemd-networkd-wait-online -i wlp3s0 --timeout=15; echo "exit code: $?" # Wi-Fi only: expect 0 at once
+```
+
+- `command not found` on the wait-online line: the path or name was mistyped (`systemd-network-wait-online` is missing the `d`). Copy the exact path from the log (`/lib/systemd/systemd-networkd-wait-online`), or type `/lib/systemd/systemd-netw` and press `Tab`. Check the file exists: `ls -l /lib/systemd/ | grep wait-online`.
+- `/lib` and `/usr/lib` are the same folder on modern Ubuntu (`/lib` is a symlink to `usr/lib`, check with `ls -ld /lib`).
+
+  - `networkctl` columns: `OPERATIONAL` = link state (`routable` = has an IP and a route to the internet, `no-carrier` = no cable/signal, `off`). `SETUP` = networkd's progress (`configured` = done, `configuring` = still working, `unmanaged` = not networkd's job, `failed`).
+  - Run the wait by hand with a short timeout: `exit code: 0` = online right now, non-zero = it would time out again.
+  - `$?` = the exit code of the last command. `0` means success, anything else means failure.
+  - `;` = run the next command no matter what. `&&` would only run it if the first one succeeded.
+- Fix options (once the theory is confirmed):
+
+| Option | How | Trade-off |
+|---|---|---|
+| A. Ignore | Nothing | Harmless: ~30 s of waiting and one error line per apt run. |
+| B. Remove `enp2s0` from netplan (my pick) | Delete the `enp2s0:` block (keep the backup), `sudo netplan try`. networkd then shows it as `unmanaged`, and every wait ignores unmanaged links. | The block does nothing useful today (it has no `dhcp4`). When I want Ethernet, add it back with `dhcp4: true`. |
+| C. Use Ethernet | Plug in a cable and add `dhcp4: true` | Best for a server long-term: steadier than this Wi-Fi card. Needs a cable run to the router. |
+
+- Confirmed (Nov 23):
+
+| Test | Result | Meaning |
+|---|---|---|
+| `systemctl cat systemd-networkd-wait-online` | Main unit runs the bare `ExecStart=/usr/lib/systemd/systemd-networkd-wait-online`. Netplan adds a drop-in, `/run/systemd/generator.late/systemd-networkd-wait-online.service.d/10-netplan.conf`. | Boot uses netplan's version, everything else gets the bare program. |
+| `networkctl status enp2s0 \| grep -i required` | `yes` | The bare wait counts Ethernet as required. |
+| Bare wait, `--timeout=15` | Timeout, `exit code: 1` | Same failure apt-helper hits. |
+| `-i wlp3s0 --timeout=15` | `exit code: 0` at once | Wi-Fi alone is online. Only Ethernet blocks the bare wait. |
+
+- Cause: `enp2s0` is managed by networkd (it's in netplan), has no cable, and counts as required for online. `optional: true` only reaches the boot-time unit through netplan's drop-in. `apt-helper` runs the bare program, which waits for Ethernet and times out.
+- Fix chosen: B, remove the `enp2s0` block from netplan.
+
+#### Fix steps
+
+```bash
+sudo cp /etc/netplan/00-installer-config.yaml /etc/netplan/00-installer-config.yaml.bak2
+sudo nano /etc/netplan/00-installer-config.yaml
+```
+
+- `.bak2`: a second backup. `.bak` already holds the original from before `optional: true`.
+- In nano, put the cursor on `  ethernets:` and press `Ctrl + K` six times. That cuts the whole Ethernet section: `ethernets:`, `enp2s0:`, `match:`, `macaddress:`, `set-name:`, `optional:`.
+- Delete `ethernets:` too. An empty `ethernets:` with nothing under it isn't valid for netplan.
+
+The file afterwards (Wi-Fi name and password hidden):
+
+```yaml
+# This is the network config written by 'subiquity'
+network:
+  version: 2
+  wifis:
+    wlp3s0:
+      access-points:
+        <wifi-name>:
+          password: <hidden>
+      dhcp4: true
+```
+
+Apply and check:
+
+```bash
+sudo netplan generate                     # no output = valid
+sudo netplan try                          # Enter to keep. Wi-Fi is unchanged, so the connection stays up.
+networkctl                                # enp2s0 SETUP should now be "unmanaged"
+sudo /lib/systemd/systemd-networkd-wait-online --timeout=15; echo "exit code: $?"   # now 0 at once
+sudo systemctl start apt-daily.service    # run the daily "apt update" job now. Takes a few seconds.
+journalctl -u apt-daily -n 10 --no-pager  # no "Timeout occurred" / "returned an error code (1)"
+```
+
+- `systemctl start apt-daily.service` is a real test of the fix: this job runs the same `apt-helper wait-online` before refreshing the package lists. Harmless, it only runs `apt update`.
+- If `networkctl` still shows `configuring` for `enp2s0`, run `sudo networkctl reload` or reboot.
+- The name `enp2s0` stays the same without `set-name`. It's the name Linux picks by default for that slot (`p2s0` = PCI bus 2, slot 0).
+
+Undo: `sudo cp /etc/netplan/00-installer-config.yaml.bak2 /etc/netplan/00-installer-config.yaml`, then `sudo netplan apply`.
+
+- Attempt 1 (Nov 23, 22:27): `netplan try` said `Configuration accepted`, but `networkctl` still showed `enp2s0 ... configuring`. The bare wait still timed out (`exit code: 1`), and the `apt-daily` test still failed after ~31 s (22:27:24 → 22:27:55).
+- Lesson: `Configuration accepted` only means netplan applied a valid file. It doesn't prove the change did what I wanted. Check the effect, not the command's message.
+- Find out where it's stuck, from config file to running system:
+
+```bash
+sudo grep -v password /etc/netplan/00-installer-config.yaml   # 0. the file itself, password hidden: no "ethernets:" expected
+sudo netplan get ethernets                              # 1. what netplan reads: "null" = Ethernet block is gone
+ls -l /run/systemd/network/                             # 2. what netplan generated: no 10-netplan-enp2s0.* files expected
+networkctl status enp2s0 | grep -i "network file"       # 3. what networkd is using right now for enp2s0
+```
+
+- Re-test after attempt 1 (same evening): still `configuring`, still `exit code: 1`. Re-running the same tests doesn't change anything. The checks above show which layer the change got stuck in.
+
+  - `netplan get <key>`: print one part of the merged netplan config. Asking only for `ethernets` keeps the Wi-Fi password off the screen. (Plain `sudo netplan get` prints everything, including the password.)
+  - `/run/systemd/network/`: netplan turns the YAML into networkd files here (`.network` = IP settings, `.link` = naming). It lives in RAM and is rebuilt on every `netplan apply` and every boot.
+  - `Network File:` = the file networkd matched to this link. `n/a` = unmanaged.
+
+| 1. `netplan get ethernets` | 2. enp2s0 files in `/run/systemd/network/` | Meaning | Next step |
+|---|---|---|---|
+| Still shows `enp2s0` | (any) | The edit didn't save, or was in the wrong place | Redo the nano edit and check with `sudo grep -v password /etc/netplan/00-installer-config.yaml` |
+| `null` | Still there | Netplan didn't regenerate | `sudo netplan apply` |
+| `null` | Gone, but `Network File:` still points to one | networkd hasn't let go of the link yet | `sudo networkctl reload`, then `networkctl`. Still `configuring`: `sudo reboot` |
+
+- Check results:
+
+| # | Result | Meaning |
+|---|---|---|
+| 0 | No `ethernets:` in the file | Edit saved |
+| 1 | `null` | Netplan no longer configures Ethernet |
+| 2 | Only `10-netplan-wlp3s0.network`, plus `zzzz-dracut-default.network` | Netplan's Ethernet files are gone, but there's a second file I didn't know about |
+| 3 | `Network File: /run/systemd/network/zzzz-dracut-default.network` | networkd now manages `enp2s0` with that file |
+
+- Real cause: a catch-all network file from dracut, not netplan.
+  - dracut builds the initramfs: the small temporary system that boots first, finds the disk (LVM here), and hands over to the real system. Ubuntu switched to dracut in 25.10.
+  - On Ubuntu 26.04 Server, dracut's network module (`dyn-netconf`, pulled in by the `ubuntu-server` package) writes `/run/systemd/network/zzzz-dracut-default.network` during early boot: "DHCP on any interface". `/run` carries over into the real system, so networkd keeps using it.
+  - How networkd picks a file: it sorts all `.network` files by name and uses the first one whose `[Match]` fits. `10-netplan-...` comes first. `zzzz-...` is named to sort last, so it catches every interface nobody else configured.
+  - So removing `enp2s0` from netplan didn't free it. The catch-all simply took over, still "required for online", still no cable.
+  - Known Ubuntu 26.04 bug: [Ubuntu Discourse thread](https://discourse.ubuntu.com/t/server-installation-creates-conflicting-dracut-and-netplan-networking-configuration/87238), Launchpad #2163380 (dracut) and #2166411 (subiquity).
+- Fix: mask the dracut file (override it from `/etc`):
+
+```bash
+cat /run/systemd/network/zzzz-dracut-default.network            # look first: the catch-all [Match] + DHCP
+sudo mkdir -p /etc/systemd/network
+sudo ln -s /dev/null /etc/systemd/network/zzzz-dracut-default.network
+ls -l /etc/systemd/network/                                     # zzzz-dracut-default.network -> /dev/null
+sudo networkctl reload
+networkctl                                                      # enp2s0: SETUP unmanaged
+networkctl status enp2s0 | grep -i "network file"               # n/a
+date
+sudo /lib/systemd/systemd-networkd-wait-online --timeout=15; echo "exit code: $?"   # 0
+sudo systemctl start apt-daily.service
+journalctl -u apt-daily -n 5 --no-pager                         # newest lines: no "Timeout occurred"
+```
+
+  - Priority for networkd files with the same name: `/etc/systemd/network/` beats `/run/systemd/network/`, which beats `/usr/lib/systemd/network/`. Same idea as unit files: `/etc` = mine, and mine wins.
+  - `ln -s <target> <link>`: create a symbolic link (a shortcut). Here the link points at `/dev/null`.
+  - A config file that points at `/dev/null` reads as empty, so it's ignored. That's called masking. `systemctl mask` uses the same trick for services.
+  - If `networkctl` still shows `configuring` after the reload, run `sudo reboot`. The mask in `/etc` survives reboots, and the `/run` file comes back each boot but gets ignored.
+  - Undo: `sudo rm /etc/systemd/network/zzzz-dracut-default.network`, then `sudo networkctl reload`.
+  - Side effect: an Ethernet cable plugged in now gets no IP until `enp2s0` is added back to netplan with `dhcp4: true`. Before, the catch-all would have run DHCP on it.
+- Bigger fix, not needed now: stop dracut generating the file at all. Add `omit_dracutmodules+=" dyn-netconf "` to a file in `/etc/dracut.conf.d/`, then rebuild the initramfs with `sudo dracut --regenerate-all --force`. That rebuilds the boot image, and a broken initramfs means no boot, so the mask is the safer choice here. Don't `apt purge dracut-network`: it also removes the `ubuntu-server` meta-package.
+- Lesson: when a change has no effect, follow it layer by layer (file → generated config → what the service actually uses). The third layer showed a file I didn't know existed.
+- Status: solved (Nov 23). `enp2s0` removed from netplan, and `/etc/systemd/network/zzzz-dracut-default.network -> /dev/null` masks dracut's catch-all. `enp2s0` is now unmanaged, so the bare wait-online and `apt-daily` no longer wait for it.
 
 ### `ath10k_pci ... AER: Error of this Agent is reported first` keeps printing
 
@@ -1328,6 +1876,7 @@ Status: solved. Diagnosed with `systemd-analyze`, `systemd-analyze blame` and `s
 
 - Reading it: 4 is probably the normal startup lines (`AER: enabled with IRQ ...`, one per PCIe port), meaning zero errors. Some boots are clean and some are flooded, so whatever the timing of the edit, the config can't be the trigger. The flood also existed on Friday.
 - ASPM policy is `[default]`: Linux keeps whatever ASPM settings the BIOS chose. So the ASPM test (Step 2) is worth running, while the errors are still flowing.
+- Boot of Nov 23, 20:09: no AER lines at `err` priority (`journalctl -b -p err` showed only KHO, SGX and a wait-online timeout). Looks like one of the clean boots. Count with `journalctl -k -b | grep -c "AER"` to add it to the table.
 - Status: diagnosing. Next: check the severity and ASPM state (Step 1), test ASPM live (Step 2), then add a GRUB boot option (Step 3).
 
 ---

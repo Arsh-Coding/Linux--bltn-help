@@ -17,6 +17,7 @@ Questions I ask while learning, with the answers. Any new command from here also
 | 9 | 2026-11-22 | How do I see the folder names on each old partition? | Phase 1 (navigation) |
 | 10 | 2026-11-22 | I opened my old files with `vi file.txt`. How do I list everything on the old disk? | Phase 1 (navigation, vi) |
 | 11 | 2026-11-22 | What's the harm if my Wi-Fi MAC address leaks? | Phase 2 (networking, privacy) |
+| 12 | 2026-11-22 | What does "heartbeat.service: Consumed 1.485s CPU time over 17min wall clock time, 3.4M memory peak" mean? | Phase 1 (services) |
 
 ---
 
@@ -493,3 +494,37 @@ Lesson: MAC filtering in a router isn't real security, because MACs are visible 
 What's more sensitive: the router's MAC, called the BSSID. Wi-Fi location databases (Google, Apple, WiGLE) map router MACs to physical places, so a BSSID can reveal roughly where I live. Commands like `iw dev wlp3s0 link` print it on the `Connected to xx:xx:...` line. Hide that one before sharing output.
 
 Why it was removed anyway: the notes already hid the MAC elsewhere, so the `wlx...` name was an accidental leak. The habit matters more than this one value: before posting output, check for passwords, network names, MAC addresses and public IPs.
+
+---
+
+## 12. What does "heartbeat.service: Consumed 1.485s CPU time over 17min wall clock time, 3.4M memory peak" mean?
+
+Question: After my `heartbeat` service stopped, this line showed up. What is it telling me?
+
+Answer: It's systemd's receipt for that run of the service. systemd keeps all of a service's processes in one cgroup (control group), counts what they use, and writes a summary to the journal when the service stops or crashes.
+
+| Part | Meaning |
+|---|---|
+| `1.485s CPU time` | How long the CPU actually worked for this service, adding up the script and every `sleep` and `date` it started |
+| `over 17min wall clock time` | How long the service was running in real time, like a clock on the wall. Here, since it last started. |
+| `3.4M memory peak` | The most RAM it used at one moment, all of its processes together. 3.4 MB is tiny. |
+
+CPU time vs wall clock time: the service existed for 17 minutes, but it was mostly asleep (`sleep 10`). The CPU only worked when it woke up to print a line.
+
+```text
+1.485 s ÷ (17 × 60 s) = 1.485 ÷ 1020 ≈ 0.15% of one CPU core
+```
+
+So the service is very light. Where the 1.485 s comes from: ~100 loops in 17 min (one every 10 s). Each loop starts two small programs (`date`, `sleep`), and starting a program costs a little CPU each time.
+
+Why it matters later: when my Node.js API runs as a service, this line is a free health report.
+
+- CPU time close to wall clock time = it was busy the whole time (heavy load, or stuck in a loop).
+- Memory peak growing run after run = possible memory leak.
+
+While the service is running, `systemctl status <service>` shows the same numbers live (`Memory:` and `CPU:` lines).
+
+```bash
+journalctl -u heartbeat | grep Consumed     # one receipt per run (each stop or crash)
+journalctl -u heartbeat -n 5                # the lines around it: why it stopped
+```
